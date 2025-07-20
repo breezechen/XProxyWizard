@@ -27,6 +27,7 @@ type Config struct {
 	IPv6Prefix     string      `json:"ipv6_prefix"`
 	IPv6Gateway    string      `json:"ipv6_gateway"`
 	DisableIPv6DNS bool        `json:"disable_ipv6_dns"`
+	MacvlanName    string      `json:"macvlan_name"`  // 新增：macvlan 网络名称
 	
 	// 保存代理服务器配置用于下次默认值
 	ProxyServer    string `json:"proxy_server,omitempty"`
@@ -70,6 +71,7 @@ const (
 	ColorGreen  = "\033[32m"
 	ColorYellow = "\033[33m"
 	ColorBlue   = "\033[34m"
+	ColorCyan   = "\033[36m"
 	ColorReset  = "\033[0m"
 	
 	ConfigFile = "/etc/xproxy/wizard-config.json"
@@ -262,8 +264,8 @@ func checkExistingDeployment() bool {
 		return true
 	}
 
-	// 检查 macvlan 网络
-	cmd = exec.Command("docker", "network", "ls", "--filter", "name=macvlan", "-q")
+	// 检查是否有 macvlan 类型的网络
+	cmd = exec.Command("docker", "network", "ls", "--filter", "driver=macvlan", "-q")
 	output, _ = cmd.Output()
 	return len(output) > 0
 }
@@ -277,9 +279,8 @@ func cleanupOldDeployment() error {
 	exec.Command("docker", "stop", "xproxy").Run()
 	exec.Command("docker", "rm", "xproxy").Run()
 
-	// 2. 删除 macvlan 网络
-	fmt.Println("删除网络...")
-	exec.Command("docker", "network", "rm", "macvlan").Run()
+	// 2. 不删除网络，因为可能被其他容器使用
+	// 如果需要删除，用户可以手动执行 docker network rm
 
 	// 3. 清理配置文件（保留wizard-config.json）
 	fmt.Println("清理配置文件...")
@@ -430,27 +431,46 @@ func askProxyIP(reader *bufio.Reader, hostIP string, defaultIP string) string {
 	// 生成建议的 IP
 	parts := strings.Split(hostIP, ".")
 	if len(parts) == 4 {
-		suggestedIP := fmt.Sprintf("%s.%s.%s.2", parts[0], parts[1], parts[2])
+		// 查找可用的 IP 地址
+		fmt.Println("正在查找可用的 IP 地址...")
+		suggestedIP := findAvailableIP(parts[0], parts[1], parts[2], defaultIP)
 		
-		// 如果有旧配置，使用旧配置作为默认值
-		if defaultIP != "" {
-			suggestedIP = defaultIP
-		}
+		for {
+			fmt.Printf("\n请输入旁路由 IP 地址 [默认: %s]: ", suggestedIP)
+			input, _ := reader.ReadString('\n')
+			input = strings.TrimSpace(input)
 
-		fmt.Printf("\n请输入旁路由 IP 地址 [默认: %s]: ", suggestedIP)
-		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(input)
+			if input == "" {
+				input = suggestedIP
+			}
 
-		if input == "" {
-			return suggestedIP
-		}
+			if !isValidIP(input) {
+				printError("无效的 IP 地址")
+				continue
+			}
 
-		if isValidIP(input) {
+			// 检查 IP 是否已被占用
+			if isIPInUse(input) {
+				printWarning(fmt.Sprintf("IP 地址 %s 已被占用", input))
+				
+				// 显示占用信息
+				showIPUsageInfo(input)
+				
+				fmt.Println("\n请选择其他 IP 地址，或停止占用该 IP 的服务")
+				
+				// 如果默认 IP 被占用，尝试建议下一个可用的
+				if input == suggestedIP {
+					newSuggested := findNextAvailableIP(parts[0], parts[1], parts[2], input)
+					if newSuggested != input {
+						suggestedIP = newSuggested
+						fmt.Printf("建议使用: %s\n", suggestedIP)
+					}
+				}
+				continue
+			}
+
 			return input
 		}
-
-		printError("无效的 IP 地址，使用默认值")
-		return suggestedIP
 	}
 
 	// 如果无法生成建议，要求用户输入
@@ -459,10 +479,19 @@ func askProxyIP(reader *bufio.Reader, hostIP string, defaultIP string) string {
 		input, _ := reader.ReadString('\n')
 		input = strings.TrimSpace(input)
 
-		if isValidIP(input) {
-			return input
+		if !isValidIP(input) {
+			printError("请输入有效的 IP 地址")
+			continue
 		}
-		printError("请输入有效的 IP 地址")
+
+		if isIPInUse(input) {
+			printWarning(fmt.Sprintf("IP 地址 %s 已被占用", input))
+			showIPUsageInfo(input)
+			fmt.Println("请选择其他地址")
+			continue
+		}
+
+		return input
 	}
 }
 
@@ -770,32 +799,101 @@ func deployXProxy(config *Config) error {
 		printWarning("开启混杂模式失败，可能需要手动设置")
 	}
 
-	// 3. 创建 macvlan 网络
-	fmt.Println("创建 Docker macvlan 网络...")
-
-	// 先检查是否存在
-	checkCmd := exec.Command("docker", "network", "ls", "--filter", "name=macvlan", "-q")
-	output, _ := checkCmd.Output()
-	if len(output) > 0 {
-		// 删除现有网络
-		exec.Command("docker", "network", "rm", "macvlan").Run()
-	}
+	// 3. 创建或复用 macvlan 网络
+	fmt.Println("配置 Docker macvlan 网络...")
 
 	// 获取子网信息
 	subnet := getSubnet(config.HostIP)
-
-	// 创建 macvlan 网络
-	// 注意：IPv6 支持通过 XProxy 内部配置实现，不需要在 Docker 网络层面配置
-	cmd = exec.Command("docker", "network", "create", "-d", "macvlan",
-		"--subnet="+subnet,
-		"--gateway="+config.GatewayIP,
-		"-o", "parent="+config.Interface,
-		"-o", "macvlan_mode=bridge",
-		"macvlan")
-
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("创建 macvlan 网络失败: %v\n输出: %s", err, string(output))
+	
+	// 查找现有的 macvlan 网络
+	var existingMacvlan string
+	cmd = exec.Command("docker", "network", "ls", "--filter", "driver=macvlan", "--format", "{{.Name}}")
+	output, _ := cmd.Output()
+	macvlanNetworks := strings.Split(strings.TrimSpace(string(output)), "\n")
+	
+	for _, netName := range macvlanNetworks {
+		if netName == "" {
+			continue
+		}
+		// 检查网络的子网是否匹配
+		inspectCmd := exec.Command("docker", "network", "inspect", netName, "--format", "{{range .IPAM.Config}}{{.Subnet}}{{end}}")
+		subnetOutput, _ := inspectCmd.Output()
+		existingSubnet := strings.TrimSpace(string(subnetOutput))
+		
+		if existingSubnet == subnet {
+			existingMacvlan = netName
+			break
+		}
+	}
+	
+	// 如果找到了匹配的 macvlan 网络
+	if existingMacvlan != "" {
+		fmt.Printf("发现已存在的 macvlan 网络 '%s' (子网: %s)\n", existingMacvlan, subnet)
+		fmt.Printf("是否使用现有网络？[Y/n]: ")
+		
+		reader := bufio.NewReader(os.Stdin)
+		answer, _ := reader.ReadString('\n')
+		answer = strings.ToLower(strings.TrimSpace(answer))
+		
+		if answer == "" || answer == "y" || answer == "yes" {
+			config.MacvlanName = existingMacvlan
+			printSuccess(fmt.Sprintf("将使用现有网络 '%s'", existingMacvlan))
+		} else {
+			// 用户选择不使用现有网络，创建新的
+			fmt.Print("请输入新网络名称 [默认: xproxy-macvlan]: ")
+			newName, _ := reader.ReadString('\n')
+			newName = strings.TrimSpace(newName)
+			if newName == "" {
+				newName = "xproxy-macvlan"
+			}
+			config.MacvlanName = newName
+			
+			// 创建新网络
+			createCmd := exec.Command("docker", "network", "create", "-d", "macvlan",
+				"--subnet="+subnet,
+				"--gateway="+config.GatewayIP,
+				"-o", "parent="+config.Interface,
+				"-o", "macvlan_mode=bridge",
+				config.MacvlanName)
+			
+			output, err := createCmd.CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("创建 macvlan 网络失败: %v\n输出: %s", err, string(output))
+			}
+			printSuccess(fmt.Sprintf("成功创建网络 '%s'", config.MacvlanName))
+		}
+	} else {
+		// 没有找到匹配的网络，创建新的
+		config.MacvlanName = "macvlan"  // 默认名称
+		fmt.Printf("创建新的 macvlan 网络 '%s'...\n", config.MacvlanName)
+		
+		createCmd := exec.Command("docker", "network", "create", "-d", "macvlan",
+			"--subnet="+subnet,
+			"--gateway="+config.GatewayIP,
+			"-o", "parent="+config.Interface,
+			"-o", "macvlan_mode=bridge",
+			config.MacvlanName)
+		
+		output, err := createCmd.CombinedOutput()
+		if err != nil {
+			// 如果创建失败，可能是因为已存在同名网络
+			if strings.Contains(string(output), "already exists") {
+				// 检查是否可以使用这个网络
+				inspectCmd := exec.Command("docker", "network", "inspect", config.MacvlanName, "--format", "{{range .IPAM.Config}}{{.Subnet}}{{end}}")
+				subnetOutput, _ := inspectCmd.Output()
+				existingSubnet := strings.TrimSpace(string(subnetOutput))
+				
+				if existingSubnet == subnet {
+					printWarning(fmt.Sprintf("网络 '%s' 已存在且子网匹配，将使用该网络", config.MacvlanName))
+				} else {
+					return fmt.Errorf("网络 '%s' 已存在但子网不匹配 (期望: %s, 实际: %s)", config.MacvlanName, subnet, existingSubnet)
+				}
+			} else {
+				return fmt.Errorf("创建 macvlan 网络失败: %v\n输出: %s", err, string(output))
+			}
+		} else {
+			printSuccess(fmt.Sprintf("成功创建网络 '%s'", config.MacvlanName))
+		}
 	}
 
 	// 4. 生成配置文件
@@ -810,10 +908,38 @@ func deployXProxy(config *Config) error {
 
 	// 6. 启动容器
 	fmt.Println("启动 XProxy 容器...")
+	
+	// 启动前再次检查 IP 是否可用
+	fmt.Printf("检查 IP 地址 %s 可用性...\n", config.ProxyIP)
+	if isIPInUse(config.ProxyIP) {
+		// 尝试找出占用者
+		cmd = exec.Command("docker", "ps", "-a", "--format", "{{.Names}}")
+		output, _ := cmd.Output()
+		containers := strings.Split(strings.TrimSpace(string(output)), "\n")
+		
+		for _, container := range containers {
+			if container == "" || container == "xproxy" {
+				continue
+			}
+			// 获取容器在 macvlan 网络中的 IP
+			inspectCmd := exec.Command("docker", "inspect", "-f", 
+				fmt.Sprintf("{{.NetworkSettings.Networks.%s.IPAddress}}", config.MacvlanName), 
+				container)
+			ipOutput, _ := inspectCmd.Output()
+			containerIP := strings.TrimSpace(string(ipOutput))
+			
+			if containerIP == config.ProxyIP {
+				return fmt.Errorf("IP 地址 %s 已被容器 '%s' 占用\n请选择其他 IP 地址或停止该容器", config.ProxyIP, container)
+			}
+		}
+		
+		return fmt.Errorf("IP 地址 %s 已被占用\n请运行 'arp -n | grep %s' 查看占用者", config.ProxyIP, config.ProxyIP)
+	}
+	
 	cmd = exec.Command("docker", "run", "-d",
 		"--name", "xproxy",
 		"--privileged",
-		"--network", "macvlan",
+		"--network", config.MacvlanName,
 		"--ip", config.ProxyIP,
 		"--restart", "unless-stopped",
 		"-v", "/etc/xproxy:/xproxy", // 注意：容器内部路径是 /xproxy
@@ -822,6 +948,11 @@ func deployXProxy(config *Config) error {
 		"dnomd343/xproxy:latest")
 
 	if output, err := cmd.CombinedOutput(); err != nil {
+		// 如果是地址已被使用的错误，提供更详细的信息
+		if strings.Contains(string(output), "Address already in use") {
+			return fmt.Errorf("启动容器失败: IP 地址 %s 已被占用\n输出: %s\n\n请尝试:\n1. 选择其他 IP 地址\n2. 检查占用该 IP 的服务: docker network inspect %s", 
+				config.ProxyIP, string(output), config.MacvlanName)
+		}
 		return fmt.Errorf("启动容器失败: %v\n%s", err, string(output))
 	}
 
@@ -1496,6 +1627,215 @@ func isValidIP(ip string) bool {
 	return net.ParseIP(ip) != nil
 }
 
+// isIPInUse 检查 IP 地址是否已被占用
+func isIPInUse(ip string) bool {
+	// 1. 获取所有 macvlan 类型的网络
+	cmd := exec.Command("docker", "network", "ls", "--filter", "driver=macvlan", "--format", "{{.Name}}")
+	output, err := cmd.Output()
+	if err == nil {
+		macvlanNetworks := strings.Fields(string(output))
+		
+		// 检查每个 macvlan 网络中的容器 IP
+		for _, network := range macvlanNetworks {
+			// 使用 docker network inspect 获取该网络中所有容器的 IP
+			inspectCmd := exec.Command("docker", "network", "inspect", network, 
+				"--format", "{{range .Containers}}{{.IPv4Address}} {{end}}")
+			ipOutput, err := inspectCmd.Output()
+			if err == nil {
+				ips := strings.Fields(string(ipOutput))
+				for _, ipWithMask := range ips {
+					containerIP := strings.Split(ipWithMask, "/")[0]
+					if containerIP == ip {
+						return true
+					}
+				}
+			}
+		}
+	}
+	
+	// 2. 检查 ARP 表（对于物理网络中的设备）
+	cmd = exec.Command("arp", "-n")
+	output, _ = cmd.Output()
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "Address") || line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == ip {
+			if fields[1] == "(incomplete)" {
+				// incomplete 不代表被占用
+				continue
+			}
+			// 有有效 MAC 地址，说明 IP 被占用
+			return true
+		}
+	}
+	
+	// 3. 最后尝试 ping（对于非 macvlan 的情况）
+	cmd = exec.Command("ping", "-c", "1", "-W", "0.2", ip)
+	err = cmd.Run()
+	if err == nil {
+		return true
+	}
+	
+	return false
+}
+
+// getUsedIPsInSubnet 批量获取子网中已使用的 IP
+func getUsedIPsInSubnet(subnet string) map[string]bool {
+	usedIPs := make(map[string]bool)
+	
+	// 从 ARP 表获取
+	cmd := exec.Command("arp", "-n")
+	output, _ := cmd.Output()
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) >= 1 && strings.HasPrefix(fields[0], subnet) {
+			usedIPs[fields[0]] = true
+		}
+	}
+	
+	// 获取所有 macvlan 网络中的容器 IP
+	networks := []string{"macvlan", "openwrt", "xproxy-macvlan"}
+	for _, network := range networks {
+		cmd = exec.Command("docker", "network", "inspect", network, 
+			"--format", "{{range .Containers}}{{.IPv4Address}} {{end}}")
+		output, _ = cmd.Output()
+		ips := strings.Fields(string(output))
+		for _, ipWithMask := range ips {
+			ip := strings.Split(ipWithMask, "/")[0]
+			if ip != "" && strings.HasPrefix(ip, subnet) {
+				usedIPs[ip] = true
+			}
+		}
+	}
+	
+	return usedIPs
+}
+
+// findAvailableIP 查找可用的 IP 地址
+func findAvailableIP(octet1, octet2, octet3, preferredIP string) string {
+	subnet := fmt.Sprintf("%s.%s.%s.", octet1, octet2, octet3)
+	
+	// 如果有首选 IP，先检查它
+	if preferredIP != "" && isValidIP(preferredIP) {
+		if !isIPInUse(preferredIP) {
+			return preferredIP
+		}
+	}
+	
+	// 从 .2 开始查找可用的 IP（只找一个就返回）
+	for i := 2; i <= 254; i++ {
+		testIP := fmt.Sprintf("%s%d", subnet, i)
+		// 快速检查是否可用
+		if !isIPInUse(testIP) {
+			return testIP
+		}
+	}
+	
+	// 如果都被占用，返回 .2
+	return fmt.Sprintf("%s%d", subnet, 2)
+}
+
+// findNextAvailableIP 从指定 IP 开始查找下一个可用的 IP
+func findNextAvailableIP(octet1, octet2, octet3, currentIP string) string {
+	parts := strings.Split(currentIP, ".")
+	if len(parts) != 4 {
+		return currentIP
+	}
+	
+	lastOctet, err := strconv.Atoi(parts[3])
+	if err != nil {
+		return currentIP
+	}
+	
+	// 从下一个 IP 开始查找
+	for i := lastOctet + 1; i <= 254; i++ {
+		testIP := fmt.Sprintf("%s.%s.%s.%d", octet1, octet2, octet3, i)
+		if !isIPInUse(testIP) {
+			return testIP
+		}
+	}
+	
+	// 如果后面都被占用，从头开始找
+	for i := 2; i < lastOctet; i++ {
+		testIP := fmt.Sprintf("%s.%s.%s.%d", octet1, octet2, octet3, i)
+		if !isIPInUse(testIP) {
+			return testIP
+		}
+	}
+	
+	return currentIP
+}
+
+// showIPUsageInfo 显示 IP 占用信息
+func showIPUsageInfo(ip string) {
+	// 1. 获取所有 macvlan 网络并检查
+	cmd := exec.Command("docker", "network", "ls", "--filter", "driver=macvlan", "--format", "{{.Name}}")
+	output, err := cmd.Output()
+	if err == nil {
+		macvlanNetworks := strings.Fields(string(output))
+		
+		for _, network := range macvlanNetworks {
+			// 获取该网络的详细信息，包括容器
+			inspectCmd := exec.Command("docker", "network", "inspect", network, 
+				"--format", "{{range $k, $v := .Containers}}{{$k}}:{{$v.IPv4Address}} {{end}}")
+			containerOutput, err := inspectCmd.Output()
+			if err == nil {
+				// 解析容器ID和IP
+				pairs := strings.Fields(string(containerOutput))
+				for _, pair := range pairs {
+					parts := strings.Split(pair, ":")
+					if len(parts) == 2 {
+						containerID := parts[0]
+						ipWithMask := parts[1]
+						containerIP := strings.Split(ipWithMask, "/")[0]
+						
+						if containerIP == ip {
+							// 获取容器名称
+							nameCmd := exec.Command("docker", "inspect", "-f", "{{.Name}}", containerID)
+							nameOutput, _ := nameCmd.Output()
+							containerName := strings.TrimSpace(strings.TrimPrefix(string(nameOutput), "/"))
+							fmt.Printf("占用者: Docker 容器 '%s' (网络: %s)\n", containerName, network)
+							return
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	// 检查 ARP 表获取 MAC 地址
+	cmd = exec.Command("arp", "-n")
+	output, _ = cmd.Output()
+	lines := strings.Split(string(output), "\n")
+	for _, line := range lines {
+		// 跳过标题行
+		if strings.Contains(line, "Address") || line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		// ARP 表格式：IP地址 HWtype MAC地址 Flags Mask 接口
+		if len(fields) >= 2 && fields[0] == ip {
+			// 如果是 incomplete，不应该显示占用信息
+			if fields[1] == "(incomplete)" {
+				return
+			}
+			// 检查是否是有效的 MAC 地址
+			if len(fields) >= 3 && len(fields[2]) == 17 && strings.Contains(fields[2], ":") {
+				fmt.Printf("占用者 MAC 地址: %s\n", fields[2])
+			} else if len(fields) >= 3 {
+				fmt.Printf("占用者 MAC 地址: %s\n", fields[2])
+			}
+			return
+		}
+	}
+	
+	fmt.Println("占用者: 未知设备")
+}
+
 func getSubnet(ip string) string {
 	parts := strings.Split(ip, ".")
 	if len(parts) == 4 {
@@ -1535,6 +1875,9 @@ func displayConfig(config *Config) {
 	fmt.Printf("网关 IP: %s\n", config.GatewayIP)
 	fmt.Printf("网络接口: %s\n", config.Interface)
 	fmt.Printf("旁路由 IP: %s\n", config.ProxyIP)
+	if config.MacvlanName != "" {
+		fmt.Printf("Docker 网络: %s\n", config.MacvlanName)
+	}
 	fmt.Printf("代理类型: %s\n", config.ProxyType)
 	if config.EnableDHCP {
 		fmt.Printf("DHCP: 启用 (%s - %s)\n", config.DHCPStart, config.DHCPEnd)
@@ -1570,6 +1913,10 @@ func printSuccess(msg string) {
 
 func printWarning(msg string) {
 	fmt.Println(ColorYellow + "⚠ " + msg + ColorReset)
+}
+
+func printInfo(msg string) {
+	fmt.Println(ColorCyan + "ℹ " + msg + ColorReset)
 }
 
 // saveConfig 保存配置到文件
